@@ -1,0 +1,265 @@
+
+import argparse
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.stats import spearmanr, wilcoxon
+
+METRICS = ["accuracy", "precision", "recall", "f1", "roc_auc"]
+MODEL_ORDER = ["LogisticRegression", "DecisionTree", "RandomForest", "SVM_RBF", "XGBoost"]
+DATASET_ORDER = ["BreastCancer", "AdultIncome", "CreditDefault", "PimaDiabetes"]
+SHIFT_NAMES = {"mean": "mean shift (+δσ, all features)",
+               "mean_signed": "signed mean shift (±δσ, random sign per feature)",
+               "variance": "variance shift"}
+
+def ms(s, nd=3):
+    return f"{s.mean():.{nd}f} ± {s.std(ddof=1):.{nd}f}"
+
+
+def trapz(y, x):
+    return float(np.sum((y[1:] + y[:-1]) * np.diff(x) / 2.0))
+
+
+def holm(pvals):
+    p = np.asarray(pvals, float)
+    order = np.argsort(p)
+    adj = np.empty_like(p)
+    running = 0.0
+    for rank, i in enumerate(order):
+        running = max(running, (len(p) - rank) * p[i])
+        adj[i] = min(1.0, running)
+    return adj
+
+
+def load(out_dir):
+    df = pd.read_csv(out_dir / "results_raw.csv")
+    key = ["dataset", "seed", "model"]
+    base = df[df.shift_type == "none"][key + METRICS].rename(
+        columns={m: f"{m}_base" for m in METRICS})
+    df = df.merge(base, on=key)
+    for m in METRICS:   # relative degradation in %  (paper's R_deltaM); negative = improvement
+        df[f"rel_{m}"] = (df[f"{m}_base"] - df[m]) / df[f"{m}_base"] * 100.0
+    df["abs_roc_auc"] = df["roc_auc_base"] - df["roc_auc"]
+    return df
+
+
+def reindex_ds_model(t):
+    idx = pd.MultiIndex.from_product([DATASET_ORDER, MODEL_ORDER])
+    return t.reindex(idx).dropna(how="all")
+
+
+def by_delta(sub, value, deltas, nd=3):
+    sub = sub[sub.delta.isin(deltas)]
+    t = sub.groupby(["dataset", "model", "delta"])[value].apply(lambda s: ms(s, nd)).unstack("delta")
+    return reindex_ds_model(t)
+
+
+def mean_degradation(curve, col):
+    """Mean of `col` over the whole delta range (normalised area under the degradation
+    curve), computed per seed.  Lower = more robust."""
+    out = []
+    for (d, m, s), g in curve.groupby(["dataset", "model", "seed"]):
+        g = g.sort_values("delta")
+        x, y = g.delta.to_numpy(), g[col].to_numpy()
+        out.append(dict(dataset=d, model=m, seed=s, score=trapz(y, x) / (x.max() - x.min())))
+    return pd.DataFrame(out)
+
+
+def significance(score_df):
+    """Most robust model (lowest mean score) vs each other model: paired Wilcoxon across seeds,
+    Holm-corrected within dataset.  NOTE: 'best' is chosen post hoc from the same data."""
+    rows = []
+    for ds in DATASET_ORDER:
+        g = score_df[score_df.dataset == ds]
+        if g.empty:
+            continue
+        piv = g.pivot(index="seed", columns="model", values="score")
+        best = piv.mean().idxmin()
+        others = [c for c in piv.columns if c != best]
+        pv = []
+        for o in others:
+            diff = piv[o] - piv[best]
+            try:
+                pv.append(wilcoxon(piv[o], piv[best]).pvalue if np.any(diff != 0) else 1.0)
+            except ValueError:
+                pv.append(1.0)
+        for o, p, pa in zip(others, pv, holm(pv)):
+            rows.append(dict(dataset=ds, most_robust=best, compared_with=o,
+                             mean_diff_pct_points=(piv[o] - piv[best]).mean(),
+                             p_value=p, p_holm=pa, significant_0_05=bool(pa < 0.05)))
+    return pd.DataFrame(rows)
+
+
+def grid(n):
+    ncols = 2 if n > 1 else 1
+    nrows = int(np.ceil(n / ncols))
+    return nrows, ncols
+
+
+# ----------------------------------------------------------------- figures
+def plot_curves(df, shift_type, rel_col, ylabel, fname, out_dir):
+    curve = df[((df.shift_type == shift_type) & (df.feature_set == "all")) | (df.shift_type == "none")]
+    nr, nc = grid(len(DATASET_ORDER))
+    fig, axes = plt.subplots(nr, nc, figsize=(5.5 * nc, 4 * nr), sharex=True, squeeze=False)
+    flat = axes.ravel()
+    for ax in flat[len(DATASET_ORDER):]:
+        ax.axis("off")
+    for ax, ds in zip(flat, DATASET_ORDER):
+        for m in MODEL_ORDER:
+            g = curve[(curve.dataset == ds) & (curve.model == m)]
+            agg = g.groupby("delta")[rel_col].agg(["mean", "std"]).reset_index()
+            ax.errorbar(agg.delta, agg["mean"], yerr=agg["std"], marker="o", ms=3, capsize=2, label=m)
+        ax.set_title(ds)
+        ax.set_xlabel(f"shift magnitude δ")
+        ax.set_ylabel(ylabel)
+        ax.axhline(0, color="k", lw=0.5)
+        ax.grid(alpha=0.3)
+    flat[0].legend(fontsize=7)
+    fig.suptitle(f"{ylabel} under {SHIFT_NAMES[shift_type]} (mean ± std over seeds)")
+    fig.tight_layout()
+    fig.savefig(out_dir / fname, dpi=200)
+    plt.close(fig)
+
+
+def plot_fraction(df, delta, out_dir):
+    sel = df[(df.shift_type == "mean") & (df.delta == delta) &
+             (df.feature_set.isin(["random", "all"]))]
+    n = len(DATASET_ORDER)
+    fig, axes = plt.subplots(1, n, figsize=(4.5 * n, 4), squeeze=False)
+    for ax, ds in zip(axes[0], DATASET_ORDER):
+        for m in MODEL_ORDER:
+            g = sel[(sel.dataset == ds) & (sel.model == m)].groupby("frac").rel_roc_auc.agg(["mean", "std"]).reset_index()
+            ax.errorbar(g.frac, g["mean"], yerr=g["std"], marker="o", ms=3, capsize=2, label=m)
+        ax.set_title(ds)
+        ax.set_xlabel("fraction of numeric features shifted")
+        ax.grid(alpha=0.3)
+    axes[0][0].set_ylabel(f"Relative ROC-AUC degradation (%) at δ={delta}")
+    axes[0][0].legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(out_dir / "fig_feature_fraction.png", dpi=200)
+    plt.close(fig)
+
+
+def plot_topbottom(df, delta, frac, out_dir):
+    sel = df[(df.shift_type == "mean") & (df.delta == delta) & (df.frac == frac)]
+    n = len(DATASET_ORDER)
+    fig, axes = plt.subplots(1, n, figsize=(4.5 * n, 4), squeeze=False)
+    for ax, ds in zip(axes[0], DATASET_ORDER):
+        g = sel[sel.dataset == ds].groupby(["feature_set", "model"]).rel_roc_auc.mean().unstack("model")
+        g = g.reindex(["random", "top", "bottom"])[MODEL_ORDER]
+        g.plot(kind="bar", ax=ax, legend=False, width=0.8)
+        ax.set_title(ds)
+        ax.set_xlabel(f"which {int(frac*100)}% of features are shifted")
+        ax.tick_params(axis="x", rotation=0)
+    axes[0][0].set_ylabel(f"Relative ROC-AUC degradation (%) at δ={delta}")
+    axes[0][0].legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(out_dir / "fig_top_vs_bottom_features.png", dpi=200)
+    plt.close(fig)
+
+
+# ----------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out-dir", default="results_v2")
+    args = ap.parse_args()
+    out = Path(args.out_dir)
+    tdir = out / "tables"
+    tdir.mkdir(exist_ok=True)
+    pd.set_option("display.width", 250, "display.max_columns", 50, "display.max_rows", 500)
+
+    df = load(out)
+    global DATASET_ORDER
+    DATASET_ORDER = [d for d in DATASET_ORDER if d in set(df.dataset)]
+    print("Datasets found:", DATASET_ORDER)
+
+    base = df[df.shift_type == "none"]
+    full = {st: df[(df.shift_type == st) & (df.feature_set == "all")] for st in SHIFT_NAMES}
+
+    def save(t, name, title):
+        t.to_csv(tdir / f"{name}.csv")
+        print(f"\n=== {title} ===\n{t}")
+
+    # T1 baseline
+    t = base.groupby(["dataset", "model"])[METRICS].agg(ms)
+    save(reindex_ds_model(t), "T1_baseline", "T1 Baseline performance (mean ± std over seeds)")
+
+    # T2 saturation diagnostic
+    pp = pd.concat([base, full["mean"]])
+    pp = pp[pp.delta.isin([0.0, 0.5, 1.0, 2.0])]
+    t = pp.groupby(["dataset", "model", "delta"]).pred_pos_rate.mean().round(3).unstack("delta")
+    save(reindex_ds_model(t), "T2_predicted_positive_rate_mean_shift",
+         "T2 Fraction predicted positive under mean shift (1.0 = model predicts everything positive)")
+
+    # T3-T5: primary (AUC) and secondary (F1) per shift type
+    deltas_show = [0.5, 1.0, 1.5, 2.0]
+    for i, (st, nm) in enumerate(SHIFT_NAMES.items(), start=3):
+        save(by_delta(pd.concat([base, full[st]]), "roc_auc", [0.0] + deltas_show, 3),
+             f"T{i}a_{st}_auc_absolute", f"T{i}a ROC-AUC under {nm} (absolute, mean ± std)")
+        save(by_delta(full[st], "rel_roc_auc", deltas_show, 2),
+             f"T{i}b_{st}_rel_auc_degradation", f"T{i}b Relative ROC-AUC degradation % under {nm} [PRIMARY]")
+        save(by_delta(full[st], "rel_f1", deltas_show, 2),
+             f"T{i}c_{st}_rel_f1_degradation", f"T{i}c Relative F1 degradation % under {nm} [secondary; negative = F1 improved]")
+
+    # T6 fraction of features shifted
+    d0 = 1.0
+    sel = df[(df.shift_type == "mean") & (df.delta == d0) & (df.feature_set.isin(["random", "all"]))]
+    t = sel.groupby(["dataset", "model", "frac"]).rel_roc_auc.apply(lambda s: ms(s, 2)).unstack("frac")
+    save(reindex_ds_model(t), "T6_fraction_of_features_shifted_auc",
+         f"T6 Relative ROC-AUC degradation % at δ={d0} vs fraction of features shifted")
+    sel = df[(df.shift_type == "mean") & (df.delta == d0) & (df.feature_set.isin(["random", "all"]))]
+    t = sel.groupby(["dataset", "model", "frac"]).rel_f1.apply(lambda s: ms(s, 2)).unstack("frac")
+    save(reindex_ds_model(t), "T6b_fraction_of_features_shifted_f1",
+         f"T6b Relative F1 degradation % at δ={d0} vs fraction of features shifted")
+
+    # T7 informative vs uninformative features
+    for dd in (1.0, 2.0):
+        sel = df[(df.shift_type == "mean") & (df.delta == dd) & (df.frac == 0.25)]
+        t = sel.groupby(["dataset", "model", "feature_set"]).rel_roc_auc.apply(lambda s: ms(s, 2)).unstack("feature_set")
+        t = t[[c for c in ["random", "top", "bottom"] if c in t.columns]]
+        save(reindex_ds_model(t), f"T7_top_vs_bottom_auc_delta{dd}",
+             f"T7 Relative ROC-AUC degradation % at δ={dd}, 25% of features shifted (random / most / least informative)")
+
+    # T8 robustness score + ranks + significance + baseline correlation
+    summary_rows = []
+    for st, nm in SHIFT_NAMES.items():
+        curve = df[((df.shift_type == st) & (df.feature_set == "all")) | (df.shift_type == "none")]
+        for col, label in (("rel_roc_auc", "AUC"), ("rel_f1", "F1")):
+            sc = mean_degradation(curve, col)
+            t = sc.groupby(["dataset", "model"]).score.apply(lambda s: ms(s, 2)).unstack("model")
+            t = t.reindex(DATASET_ORDER)[MODEL_ORDER]
+            save(t, f"T8_robustness_score_{st}_{label}",
+                 f"T8 Robustness score ({label}) = mean relative degradation % over δ∈[0,2], {nm} (lower = better)")
+            rk = sc.groupby(["dataset", "model"]).score.mean().unstack("model")[MODEL_ORDER].rank(axis=1)
+            rk = rk.reindex(DATASET_ORDER)
+            save(rk, f"T9_rank_{st}_{label}", f"T9 Robustness rank ({label}), {nm} (1 = most robust)")
+            print("Average rank:", rk.mean().sort_values().round(2).to_dict())
+            if label == "AUC":
+                sig = significance(sc)
+                sig.to_csv(tdir / f"T10_significance_{st}_AUC.csv", index=False)
+                print(f"\n=== T10 Significance (AUC robustness score), {nm} ===\n{sig.round(4)}")
+                b = base.groupby(["dataset", "model"]).roc_auc.mean()
+                r = sc.groupby(["dataset", "model"]).score.mean()
+                j = pd.concat([b.rename("baseline_auc"), r.rename("mean_rel_auc_degradation")], axis=1).dropna()
+                rho, p = spearmanr(j.baseline_auc, j.mean_rel_auc_degradation)
+                summary_rows.append(dict(shift=st, n_pairs=len(j), spearman_rho=rho, p_value=p))
+    sp = pd.DataFrame(summary_rows)
+    sp.to_csv(tdir / "T11_baseline_vs_degradation_spearman.csv", index=False)
+    print("\n=== T11 Spearman(baseline AUC, AUC degradation) over (dataset, model) pairs ===\n", sp.round(3))
+    print("(Caution: with few pairs and a shared 'floor', this is weak evidence either way.)")
+
+    # figures
+    for st in SHIFT_NAMES:
+        plot_curves(df, st, "rel_roc_auc", "Relative ROC-AUC degradation (%)", f"fig_auc_{st}.png", out)
+    plot_curves(df, "mean", "rel_f1", "Relative F1 degradation (%)", "fig_f1_mean.png", out)
+    plot_fraction(df, 1.0, out)
+    plot_topbottom(df, 2.0, 0.25, out)
+    print(f"\nTables  -> {tdir}\nFigures -> {out}/fig_*.png")
+
+
+if __name__ == "__main__":
+    main()
