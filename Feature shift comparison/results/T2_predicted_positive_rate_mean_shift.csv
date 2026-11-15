@@ -1,0 +1,16 @@
+,,0.0,0.5,1.0,2.0
+BreastCancer,LogisticRegression,0.363,0.632,0.96,1.0
+BreastCancer,DecisionTree,0.382,0.624,0.92,0.986
+BreastCancer,RandomForest,0.368,0.6,0.942,1.0
+BreastCancer,SVM_RBF,0.363,0.585,0.926,1.0
+BreastCancer,XGBoost,0.366,0.626,0.96,1.0
+AdultIncome,LogisticRegression,0.202,0.494,0.808,0.999
+AdultIncome,DecisionTree,0.252,0.325,0.918,0.98
+AdultIncome,RandomForest,0.213,0.282,0.758,0.978
+AdultIncome,SVM_RBF,0.188,0.4,0.678,0.961
+AdultIncome,XGBoost,0.21,0.182,0.974,1.0
+CreditDefault,LogisticRegression,0.065,0.048,0.036,0.023
+CreditDefault,DecisionTree,0.244,0.194,0.339,0.39
+CreditDefault,RandomForest,0.12,0.111,0.122,0.356
+CreditDefault,SVM_RBF,0.099,0.148,0.239,0.074
+CreditDefault,XGBoost,0.123,0.067,0.106,0.09
